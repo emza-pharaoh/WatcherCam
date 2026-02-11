@@ -4,13 +4,24 @@ import time
 from telegram import Bot
 import os
 from dotenv import load_dotenv
+from ultralytics import YOLO
+from collections import deque
 
 # ==================== CONFIG
 
-COOLDOWN = 15
-motion_history = []
-MOTION_FRAMES_REQUIRED = 4
 
+
+
+VIDEO_DURATION = 5  # seconds
+VIDEO_FPS = 20
+PRE_RECORD_SECONDS = 3
+COOLDOWN = 15
+MOTION_FRAMES_REQUIRED = 4
+BUFFER_SIZE = PRE_RECORD_SECONDS * VIDEO_FPS
+
+from collections import deque
+frame_buffer = deque(maxlen=BUFFER_SIZE)
+motion_history = []
 load_dotenv()
 
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
@@ -24,16 +35,18 @@ bot = Bot(token=BOT_TOKEN)
 
 
 
-cap = cv2.VideoCapture(0) #Opening default camera
+
+cap = cv2.VideoCapture(1) #Opening default camera
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 460)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
 
-
+model = YOLO("yolov8n.pt")
 
 bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+    
     history=500,
     varThreshold=50,
     detectShadows=False
@@ -46,6 +59,7 @@ kernel = np.array([[0, -1, 0],
                    [0, -1, 0]])
 while cap.isOpened():
     ret, frame = cap.read()
+    frame_buffer.append(frame.copy())
     if not ret:
         break
     frame = cv2.filter2D(frame, -1, kernel)
@@ -107,26 +121,72 @@ while cap.isOpened():
         motion_counter >= MOTION_FRAMES_REQUIRED
         and current_time - last_alert_time > COOLDOWN
     ):
-        # ====== MOTION DETECTED ======= #
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        filename = f"motion_{timestamp}.png"
+        print("motion confirmed. RUnning person detection")
 
-        #save screenshot of motion
-        cv2.imwrite(filename, frame)
+        small_frame = cv2.resize(frame, (640, 480))
 
+        results = model(small_frame)
 
-        print(f"[ALERT] Motion detected -> saved {filename}")
+        person_detected = False
 
-        with open(filename, "rb") as img:
-            bot.send_photo(
-                chat_id = CHAT_ID ,
-                photo = img,
-                caption = "motion detected!"
+        for r in results:
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls == 0: #class 0 = human
+                    person_detected = True
+        
+        if person_detected:
+
+            print("Person detected! Recording video...")
+
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"alert_{timestamp}.mp4"
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(
+                filename,
+                fourcc,
+                VIDEO_FPS,
+                (frame.shape[1], frame.shape[0])
+            )
+
+                        # Write buffered frames first (pre-motion)
+            for buffered_frame in frame_buffer:
+                out.write(buffered_frame)
+
+            # Then record additional seconds (post-motion)
+            start_record_time = time.time()
+
+            while time.time() - start_record_time < VIDEO_DURATION:
+                ret, record_frame = cap.read()
+                if not ret:
+                    break
+
+                frame_buffer.append(record_frame.copy())  # Keep buffer updated
+                out.write(record_frame)
+                cv2.imshow("WatcherCam", record_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            out.release()
+
+            print("Sending video alert...")
+
+            with open(filename, "rb") as vid:
+                bot.send_video(
+                    chat_id=CHAT_ID,
+                    video=vid,
+                    caption="🚨 Person detected!"
                 )
-            
-        os.remove(filename)
-        motion_counter = 0
-        last_alert_time = current_time
+
+            os.remove(filename)
+
+            motion_counter = 0
+            last_alert_time = current_time
+
+        else:
+            print("Motion Detected but No Person Found")
+        
 
 
     #show live camera feed
